@@ -11,26 +11,24 @@ import importlib.util
 import sys
 from io import StringIO
 import contextlib
+import json
+from datetime import datetime, date
+import calendar
+
 # Constants
 PROBLEMS_DIR = "Problems"
 SUPPORTED_EXTENSIONS = ['.md', '.html', '.py']
+USER_DATA_FILE = "user_data.json"
 
-def setup_page():
-    """Configure the Streamlit page settings"""
-    st.set_page_config(
-        page_title="DML-OpenProblem Interactive Platform",
-        page_icon="📚",
-        layout="wide"
-    )
-    
-    st.title("DML-OpenProblem Interactive Platform")
-
+# Utility Functions
 def get_problem_directories():
     """Get all problem directories sorted numerically"""
+    if not os.path.exists(PROBLEMS_DIR):
+        os.makedirs(PROBLEMS_DIR)
+        
     problem_dirs = [d for d in os.listdir(PROBLEMS_DIR) 
                    if os.path.isdir(os.path.join(PROBLEMS_DIR, d))]
     
-    # Sort directories numerically when possible
     def get_number(dirname):
         match = re.match(r'(\d+)_', dirname)
         return int(match.group(1)) if match else float('inf')
@@ -60,7 +58,6 @@ def render_math_content(content, file_ext):
     if file_ext == '.md':
         content = markdown.markdown(content)
     
-    # Replace LaTeX delimiters
     content = re.sub(r'\\\(', r'$', content)
     content = re.sub(r'\\\)', r'$', content)
     content = re.sub(r'\\\[', r'$$', content)
@@ -88,169 +85,587 @@ def render_math_content(content, file_ext):
         scrolling=True
     )
 
-def create_new_problem():
-    """Interface for creating a new problem"""
-    st.subheader("Create New Problem")
+def get_problem_solutions(problem_dir):
+    """Get all solution files for a problem"""
+    solutions = []
+    if os.path.exists(problem_dir):
+        for file in os.listdir(problem_dir):
+            if file.startswith('solution') and file.endswith('.py'):
+                solutions.append(file)
+    return sorted(solutions)
+
+# User Progress Management
+class UserProgress:
+    def __init__(self):
+        self.load_user_data()
     
-    col1, col2 = st.columns(2)
-    with col1:
-        problem_number = st.number_input("Problem Number", min_value=1, step=1)
-        problem_name = st.text_input("Problem Name")
+    def load_user_data(self):
+        if os.path.exists(USER_DATA_FILE):
+            with open(USER_DATA_FILE, 'r') as f:
+                self.data = json.load(f)
+        else:
+            self.data = {
+                "completed_problems": [],
+                "daily_progress": {},
+                "current_streak": 0,
+                "last_daily_challenge": None
+            }
     
-    if st.button("Create Problem"):
-        if problem_number and problem_name:
-            dir_name = f"{problem_number}_{problem_name.replace(' ', '_')}"
-            problem_path = os.path.join(PROBLEMS_DIR, dir_name)
-            
-            try:
-                os.makedirs(problem_path, exist_ok=True)
-                # Create template files
-                with open(os.path.join(problem_path, 'learn.md'), 'w') as f:
-                    f.write("# Problem Description\n\n## Overview\n\n## Examples\n")
-                with open(os.path.join(problem_path, 'solution.py'), 'w') as f:
-                    f.write("def solution():\n    pass\n\n# Test cases\n")
-                
-                st.success(f"Created new problem: {dir_name}")
-            except Exception as e:
-                st.error(f"Error creating problem: {e}")
-
-
-
-
-
-def execute_notebook(notebook_path):
-    """
-    Safely execute a notebook.py file and capture its output
-    """
-    try:
-        # Create a spec for the module
-        spec = importlib.util.spec_from_file_location("notebook_module", notebook_path)
-        if spec is None:
-            raise ImportError(f"Could not load spec for {notebook_path}")
-            
-        # Create the module
-        module = importlib.util.module_from_spec(spec)
-        if spec.loader is None:
-            raise ImportError(f"Could not load module for {notebook_path}")
-            
-        # Add the module to sys.modules
-        sys.modules["notebook_module"] = module
+    def save_user_data(self):
+        with open(USER_DATA_FILE, 'w') as f:
+            json.dump(self.data, f)
+    
+    def mark_problem_complete(self, problem_id):
+        if problem_id not in self.data["completed_problems"]:
+            self.data["completed_problems"].append(problem_id)
+            today = date.today().isoformat()
+            self.data["daily_progress"][today] = self.data["daily_progress"].get(today, 0) + 1
+            self.update_streak()
+            self.save_user_data()
+    
+    def update_streak(self):
+        today = date.today()
+        streak = 0
+        current_date = today
         
-        # Execute the module
-        buffer = StringIO()
-        with contextlib.redirect_stdout(buffer):
-            spec.loader.exec_module(module)
-            
-        return buffer.getvalue()
+        while current_date.isoformat() in self.data["daily_progress"]:
+            streak += 1
+            current_date = current_date.replace(day=current_date.day - 1)
         
-    except Exception as e:
-        raise Exception(f"Error executing notebook: {str(e)}")
+        self.data["current_streak"] = streak
 
-
-
-
-def main():
-    setup_page()
-    
-    # Sidebar navigation
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio(
-        "Select Page",
-        ["Problem Browser", "Create New Problem", "Interactive Learn"]
+# UI Components
+def setup_page():
+    """Configure the Streamlit page settings"""
+    st.set_page_config(
+        page_title="Deep-ML Interactive Platform",
+        page_icon="📚",
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
     
-    if page == "Problem Browser":
-        # Get problem directories
-        problem_dirs = get_problem_directories()
-        
-        # Problem selection
-        selected_problem = st.sidebar.selectbox(
-            "Select Problem",
-            problem_dirs
-        )
-        
-        if selected_problem:
-            problem_path = os.path.join(PROBLEMS_DIR, selected_problem)
+    # Custom CSS
+    st.markdown("""
+        <style>
+        .stButton button {
+            width: 100%;
+        }
+        .stProgress > div > div > div {
+            background-color: #4CAF50;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+def render_header():
+    """Render the application header with navigation"""
+    col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
+    with col1:
+        st.title("Deep-ML")
+    with col2:
+        if st.button("Problems", key="nav_problems"):
+            st.session_state["page"] = "problem_explorer"
+    with col3:
+        if st.button("Daily Challenge", key="nav_challenge"):
+            st.session_state["page"] = "daily_challenge"
+    with col4:
+        if st.button("Submit Problem", key="nav_submit"):
+            st.session_state["page"] = "submit_problem"
+    with col5:
+        if st.button("Profile", key="nav_profile"):
+            st.session_state["page"] = "profile"
+
+def get_problem_metadata():
+    """Get metadata for all problems including difficulty and category"""
+    problems = []
+    for problem_dir in get_problem_directories():
+        match = re.match(r'(\d+)_(.+)', problem_dir)
+        if match:
+            number, name = match.groups()
             
-            # File selection
-            files = [f for f in os.listdir(problem_path) 
-                    if os.path.splitext(f)[1] in SUPPORTED_EXTENSIONS]
-            selected_file = st.sidebar.selectbox(
-                "Select File",
-                files
+            # Determine difficulty and category
+            if int(number) < 10:
+                difficulty = "easy"
+            elif int(number) < 20:
+                difficulty = "medium"
+            else:
+                difficulty = "hard"
+            
+            # Determine category based on content
+            name_lower = name.lower()
+            if "matrix" in name_lower or "eigen" in name_lower:
+                category = "Linear Algebra"
+            elif "regression" in name_lower or "learning" in name_lower:
+                category = "Machine Learning"
+            elif "tree" in name_lower or "graph" in name_lower:
+                category = "Data Structures"
+            else:
+                category = "Mathematics"
+            
+            problems.append({
+                "id": int(number),
+                "title": name.replace('_', ' '),
+                "difficulty": difficulty,
+                "category": category,
+                "directory": problem_dir
+            })
+    
+    return sorted(problems, key=lambda x: x["id"])
+
+def render_problem_explorer():
+    """Render the problem explorer with filtering and sorting"""
+    st.header("Problem Explorer")
+    
+    # Filters
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        difficulty_filter = st.selectbox(
+            "Difficulty",
+            ["All", "Easy", "Medium", "Hard"],
+            key="difficulty_filter"
+        )
+    
+    with col2:
+        categories = ["All", "Linear Algebra", "Machine Learning", 
+                     "Data Structures", "Mathematics"]
+        category_filter = st.selectbox(
+            "Category",
+            categories,
+            key="category_filter"
+        )
+    
+    with col3:
+        search = st.text_input("Search", key="problem_search")
+    
+    # Get and filter problems
+    problems = get_problem_metadata()
+    
+    if difficulty_filter != "All":
+        problems = [p for p in problems if p["difficulty"].lower() == difficulty_filter.lower()]
+    if category_filter != "All":
+        problems = [p for p in problems if p["category"] == category_filter]
+    if search:
+        problems = [p for p in problems if search.lower() in p["title"].lower()]
+    
+    # Display problems
+    render_problems_table(problems)
+
+def render_problems_table(problems):
+    """Render the problems in a table format"""
+    for idx, problem in enumerate(problems):
+        with st.container():
+            cols = st.columns([1, 3, 2, 2, 2])
+            
+            # Problem ID and Title
+            cols[0].write(f"#{problem['id']}")
+            cols[1].write(problem["title"])
+            
+            # Difficulty with color coding
+            difficulty_colors = {
+                "easy": "green",
+                "medium": "orange",
+                "hard": "red"
+            }
+            cols[2].markdown(
+                f'<span style="color: {difficulty_colors[problem["difficulty"]]}">'
+                f'{problem["difficulty"].capitalize()}</span>',
+                unsafe_allow_html=True
             )
             
-            if selected_file:
-                file_path = os.path.join(problem_path, selected_file)
-                file_ext = os.path.splitext(selected_file)[1]
-                
-                # Main content area
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.subheader("Editor")
-                    content = load_file_content(file_path)
-                    
-                    # Determine language for the editor
-                    lang_map = {'.py': 'python', '.md': 'markdown', '.html': 'html'}
-                    editor_lang = lang_map.get(file_ext, 'text')
-                    
-                    edited_content = st_ace(
-                        value=content,
-                        language=editor_lang,
-                        theme="monokai",
-                        key=f"editor_{selected_file}",
-                        height=500
-                    )
-                    
-                    if st.button("Save Changes"):
-                        save_file_content(file_path, edited_content)
-                
-                with col2:
-                    st.subheader("Preview")
-                    if file_ext in ['.md', '.html']:
-                        render_math_content(edited_content, file_ext)
-                    elif file_ext == '.py':
-                        st.code(edited_content, language='python')
-    
-    elif page == "Create New Problem":
-        create_new_problem()
-    
+            # Category
+            cols[3].write(problem["category"])
+            
+            # Actions
+            if cols[4].button("Solve", key=f"solve_{problem['id']}_{idx}"):
+                st.session_state["current_problem"] = problem
+                st.session_state["page"] = "problem_solver"
+            
+            st.markdown("---")
 
-    elif page == "Interactive Learn":
-        st.subheader("Interactive Learning Platform")
-        
-        # Get interactive learn directories
-        learn_dirs = glob.glob(os.path.join(PROBLEMS_DIR, "interactive_learn", "problem-*"))
-        
-        selected_learn = st.sidebar.selectbox(
-            "Select Interactive Problem",
-            [os.path.basename(d) for d in learn_dirs]
+def render_problem_solver(problem):
+    """Render the problem solving environment"""
+    st.header(f"Problem {problem['id']}: {problem['title']}")
+    
+    problem_path = os.path.join(PROBLEMS_DIR, problem['directory'])
+    
+    # Create tabs
+    tabs = st.tabs(["Description", "Editor", "Solutions"])
+    
+    # Description Tab
+    with tabs[0]:
+        description_file = next(
+            (f for f in os.listdir(problem_path) if f.startswith("learn.")),
+            None
+        )
+        if description_file:
+            content = load_file_content(os.path.join(problem_path, description_file))
+            render_math_content(content, os.path.splitext(description_file)[1])
+    
+    # Editor Tab
+    with tabs[1]:
+        st.write("## Code Editor")
+        code = st_ace(
+            placeholder="Write your solution here...",
+            language="python",
+            theme="monokai",
+            key=f"editor_{problem['id']}",
+            height=400
         )
         
-        if selected_learn:
-            notebook_path = os.path.join(PROBLEMS_DIR, "interactive_learn", selected_learn, "notebook.py")
-            if os.path.exists(notebook_path):
-                # Show the notebook content
-                content = load_file_content(notebook_path)
-                with st.expander("View Notebook Code"):
-                    st.code(content, language='python')
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("Run Code", key=f"run_{problem['id']}"):
+                try:
+                    with StringIO() as buf, contextlib.redirect_stdout(buf):
+                        exec(code)
+                        output = buf.getvalue()
+                    st.write("### Output:")
+                    st.code(output)
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+        
+        with col2:
+            if st.button("Submit", key=f"submit_{problem['id']}"):
+                solution_name = st.text_input(
+                    "Save solution as:",
+                    value=f"solution_{len(get_problem_solutions(problem_path)) + 1}.py",
+                    key=f"solution_name_{problem['id']}"
+                )
+                if st.button("Save Solution", key=f"save_{problem['id']}"):
+                    save_file_content(
+                        os.path.join(problem_path, solution_name),
+                        code
+                    )
+                    st.session_state.user_progress.mark_problem_complete(problem['id'])
+    
+    # Solutions Tab
+    with tabs[2]:
+        solutions = get_problem_solutions(problem_path)
+        if solutions:
+            selected_solution = st.selectbox(
+                "Select Solution",
+                solutions,
+                key=f"solution_select_{problem['id']}"
+            )
+            
+            if selected_solution:
+                solution_content = load_file_content(
+                    os.path.join(problem_path, selected_solution)
+                )
+                st.code(solution_content, language='python')
                 
-                # Add execution controls
-                if st.button("Run Notebook"):
+                if st.button("Run Solution", key=f"run_solution_{problem['id']}"):
                     try:
-                        with st.spinner("Executing notebook..."):
-                            output = execute_notebook(notebook_path)
-                            st.success("Notebook executed successfully!")
-                            
-                            # Show output in an expander
-                            with st.expander("Execution Output"):
-                                st.text(output)
-                                
+                        with StringIO() as buf, contextlib.redirect_stdout(buf):
+                            exec(solution_content)
+                            output = buf.getvalue()
+                        st.write("### Output:")
+                        st.code(output)
                     except Exception as e:
-                        st.error(f"Error executing notebook: {str(e)}")
-                        st.info("Make sure the notebook.py file contains valid Python code and required dependencies are installed.")
+                        st.error(f"Error: {str(e)}")
+        else:
+            st.info("No solutions available yet.")
+
+def render_daily_challenge():
+    """Render the daily challenge"""
+    st.header("Daily Challenge")
+    
+    today = date.today()
+    problems = get_problem_metadata()
+    
+    if problems:
+        # Select a problem based on the date
+        problem_index = today.toordinal() % len(problems)
+        problem = problems[problem_index]
+        
+        st.write(f"### Problem {problem['id']}: {problem['title']}")
+        st.write(f"**Difficulty:** {problem['difficulty'].capitalize()}")
+        st.write(f"**Category:** {problem['category']}")
+        
+        if st.button("Start Challenge", key="start_daily_challenge"):
+            st.session_state["current_problem"] = problem
+            st.session_state["page"] = "problem_solver"
+    else:
+        st.warning("No problems available for daily challenge.")
+
+# def render_user_profile():
+#     """Render user profile and statistics"""
+#     st.header("Your Profile")
+    
+#     # Statistics
+#     col1, col2, col3 = st.columns(3)
+    
+#     with col1:
+#         total_problems = len(get_problem_directories())
+#         completed = len(st.session_state.user_progress.data["completed_problems"])
+#         completion_rate = (completed / total_problems * 100) if total_problems > 0 else 0
+#         st.metric("Completion Rate", f"{completion_rate:.1f}%")
+    
+#     with col2:
+#         st.metric("Problems Solved", completed)
+    
+#     with col3:
+#         st.metric("Current Streak", f"{st.session_state.user_progress.data['current_streak']} days")
+    
+#     # Progress Calendar
+#     st.write("## Progress Calendar")
+#     today = date.today()
+#     cal = calendar.monthcalendar(today.year, today.month)
+    
+#     # Create calendar grid
+#     cols = st.columns(7)
+#     for i, day in enumerate(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri",
+
+
+def render_user_profile():
+    """Render user profile and statistics"""
+    st.header("Your Profile")
+    
+    # Statistics
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        total_problems = len(get_problem_directories())
+        completed = len(st.session_state.user_progress.data["completed_problems"])
+        completion_rate = (completed / total_problems * 100) if total_problems > 0 else 0
+        st.metric("Completion Rate", f"{completion_rate:.1f}%")
+    
+    with col2:
+        st.metric("Problems Solved", completed)
+    
+    with col3:
+        st.metric("Current Streak", f"{st.session_state.user_progress.data['current_streak']} days")
+    
+    # Progress Calendar
+    st.write("## Progress Calendar")
+    today = date.today()
+    cal = calendar.monthcalendar(today.year, today.month)
+    
+    # Create calendar grid
+    cols = st.columns(7)
+    for i, day in enumerate(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]):
+        cols[i].write(f"**{day}**")
+    
+    for week in cal:
+        cols = st.columns(7)
+        for i, day in enumerate(week):
+            if day == 0:
+                cols[i].write("")
             else:
-                st.warning(f"No notebook.py file found in {selected_learn}")
+                date_str = f"{today.year}-{today.month:02d}-{day:02d}"
+                if date_str in st.session_state.user_progress.data["daily_progress"]:
+                    cols[i].markdown(f"**{day}** ✅")
+                else:
+                    cols[i].write(str(day))
+    
+    # Problem History
+    st.write("## Problem History")
+    if completed > 0:
+        problems = get_problem_metadata()
+        completed_problems = [p for p in problems 
+                            if p["id"] in st.session_state.user_progress.data["completed_problems"]]
+        
+        for problem in completed_problems:
+            with st.expander(f"Problem {problem['id']}: {problem['title']}"):
+                st.write(f"**Category:** {problem['category']}")
+                st.write(f"**Difficulty:** {problem['difficulty'].capitalize()}")
+                
+                # Show solutions
+                problem_path = os.path.join(PROBLEMS_DIR, problem['directory'])
+                solutions = get_problem_solutions(problem_path)
+                if solutions:
+                    st.write("**Your Solutions:**")
+                    for solution in solutions:
+                        st.code(load_file_content(os.path.join(problem_path, solution)), 
+                               language='python')
+    else:
+        st.info("You haven't solved any problems yet. Start solving to build your history!")
+
+def render_submit_problem():
+    """Render the problem submission form"""
+    st.header("Submit a New Problem")
+    
+    with st.form("problem_submission"):
+        st.write("### Problem Details")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            problem_number = st.number_input(
+                "Problem Number",
+                min_value=1,
+                help="Must be unique"
+            )
+            
+            problem_title = st.text_input(
+                "Problem Title",
+                help="A descriptive title for the problem"
+            )
+            
+            difficulty = st.selectbox(
+                "Difficulty Level",
+                ["Easy", "Medium", "Hard"]
+            )
+        
+        with col2:
+            category = st.selectbox(
+                "Category",
+                ["Linear Algebra", "Machine Learning", "Data Structures", "Mathematics"]
+            )
+            
+            tags = st.text_input(
+                "Tags",
+                help="Comma-separated tags"
+            )
+        
+        st.write("### Problem Content")
+        
+        description = st.text_area(
+            "Problem Description (Markdown)",
+            height=200,
+            help="Support Markdown and LaTeX"
+        )
+        
+        sample_solution = st.text_area(
+            "Sample Solution",
+            height=200,
+            help="Python code"
+        )
+        
+        submitted = st.form_submit_button("Submit Problem")
+        
+        if submitted:
+            try:
+                # Create problem directory
+                problem_dir = f"{problem_number}_{problem_title.replace(' ', '_')}"
+                problem_path = os.path.join(PROBLEMS_DIR, problem_dir)
+                os.makedirs(problem_path, exist_ok=True)
+                
+                # Save description
+                with open(os.path.join(problem_path, 'learn.md'), 'w') as f:
+                    f.write(description)
+                
+                # Save sample solution
+                with open(os.path.join(problem_path, 'solution.py'), 'w') as f:
+                    f.write(sample_solution)
+                
+                st.success("Problem submitted successfully!")
+                
+            except Exception as e:
+                st.error(f"Error submitting problem: {str(e)}")
+
+
+
+
+
+# [Previous code remains the same until the main function...]
+
+def main():
+    """Main application function"""
+    setup_page()
+    
+    # Initialize session state
+    if "page" not in st.session_state:
+        st.session_state["page"] = "home"
+    if "user_progress" not in st.session_state:
+        st.session_state["user_progress"] = UserProgress()
+    if "current_problem" not in st.session_state:
+        st.session_state["current_problem"] = None
+    if "nav_selection" not in st.session_state:
+        st.session_state["nav_selection"] = "Home"
+    
+    # Render header
+    render_header()
+    
+    # Sidebar navigation - using session state to prevent unnecessary reruns
+    with st.sidebar:
+        st.title("Navigation")
+        current_nav = st.radio(
+            "Go to",
+            ["Home", "Problem Explorer", "Daily Challenge", "Profile", "Submit Problem"],
+            key="navigation",
+            index=["Home", "Problem Explorer", "Daily Challenge", "Profile", "Submit Problem"].index(st.session_state["nav_selection"])
+        )
+        
+        # Only update and rerun if navigation actually changed
+        if current_nav != st.session_state["nav_selection"]:
+            st.session_state["nav_selection"] = current_nav
+            st.session_state["page"] = current_nav.lower().replace(" ", "_")
+            st.rerun()
+    
+    # Main content
+    if st.session_state["page"] == "home":
+        render_daily_challenge()
+        st.markdown("---")
+        render_problem_explorer()
+    
+    elif st.session_state["page"] == "problem_explorer":
+        render_problem_explorer()
+    
+    elif st.session_state["page"] == "daily_challenge":
+        render_daily_challenge()
+    
+    elif st.session_state["page"] == "profile":
+        render_user_profile()
+    
+    elif st.session_state["page"] == "submit_problem":
+        render_submit_problem()
+    
+    elif st.session_state["page"] == "problem_solver" and st.session_state["current_problem"]:
+        render_problem_solver(st.session_state["current_problem"])
+
+# [Rest of the code remains the same...]
+
+
+# def main():
+#     """Main application function"""
+#     setup_page()
+    
+#     # Initialize session state
+#     if "page" not in st.session_state:
+#         st.session_state["page"] = "home"
+#     if "user_progress" not in st.session_state:
+#         st.session_state["user_progress"] = UserProgress()
+#     if "current_problem" not in st.session_state:
+#         st.session_state["current_problem"] = None
+    
+#     # Render header
+#     render_header()
+    
+#     # Sidebar navigation
+#     with st.sidebar:
+#         st.title("Navigation")
+#         nav_selection = st.radio(
+#             "Go to",
+#             ["Home", "Problem Explorer", "Daily Challenge", "Profile", "Submit Problem"]
+#         )
+        
+#         if nav_selection != st.session_state["page"]:
+#             st.session_state["page"] = nav_selection.lower().replace(" ", "_")
+#             st.experimental_rerun()
+    
+#     # Main content
+#     if st.session_state["page"] == "home":
+#         render_daily_challenge()
+#         st.markdown("---")
+#         render_problem_explorer()
+    
+#     elif st.session_state["page"] == "problem_explorer":
+#         render_problem_explorer()
+    
+#     elif st.session_state["page"] == "daily_challenge":
+#         render_daily_challenge()
+    
+#     elif st.session_state["page"] == "profile":
+#         render_user_profile()
+    
+#     elif st.session_state["page"] == "submit_problem":
+#         render_submit_problem()
+    
+#     elif st.session_state["page"] == "problem_solver" and st.session_state["current_problem"]:
+#         render_problem_solver(st.session_state["current_problem"])
+
 if __name__ == "__main__":
     main()
+                        
